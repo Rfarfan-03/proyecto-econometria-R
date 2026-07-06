@@ -1,0 +1,711 @@
+---
+title: "Proyecto Final - Econometria en R"
+subtitle: "Ricardo Farfan - 21003210 , Rodrigo Solis - 21002223, Gabriela Subuyu - 21001134"
+author: "Ricardo Farfan, Rodrigo Solis, Gabriela Subuyu"
+date: "`r format(Sys.Date(), '%d de %B de %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+# Configuración global de los chunks:
+# - echo = TRUE   -> mostramos el código.
+# - warning/message = FALSE -> evitamos evita mensajes extras
+# - fig.align center y tamanios de figuras.
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.align = "center", fig.width = 8, fig.height = 5
+)
+set.seed(2026) 
+```
+
+# Contexto del proyecto
+
+El objetivo es predecir `SalePrice`, precio de venta de viviendas en Ames, Iowa. 
+Utilizando como metrica principal el **RMSE**.
+
+
+
+```{r librerias}
+# Cargamos las librerias a utilizar
+library(dplyr)
+library(ggplot2)
+```
+
+# Carga de datos
+
+```{r carga}
+base  <- "DATASETS"
+train <- read.csv(file.path(base, "data_train_v3.csv"), stringsAsFactors = FALSE)
+test  <- read.csv(file.path(base, "test_v3.csv"),       stringsAsFactors = FALSE)
+
+# Verificación de dimensiones.
+cat("Entrenamiento:", nrow(train), "filas x", ncol(train), "columnas\n")
+cat("Prueba       :", nrow(test),  "filas x", ncol(test),  "columnas\n")
+```
+
+Los datasets de training y testing tienen una unica columna de diferencia que es SalesPrice, la cual es 
+la que tenemos que predecir.
+
+```{r columna-diferente}
+# Mostrando la variable SalesPrice que es la diferencia entre los dataasets
+setdiff(names(train), names(test))
+```
+
+# Estructura general de las variables
+
+```{r tipos}
+# Clasificamos las columnas por tipo entender que hacer en el preprocesamiento.
+# Distinguir numéricas y categóricas 
+tipos <- sapply(train, class)
+data.frame(
+  tipo = c("numéricas (int/num)", "categóricas (character)"),
+  n    = c(sum(tipos %in% c("numeric", "integer")),
+           sum(tipos == "character"))
+)
+```
+
+Tenemos 38 variables numéricas y 43 categóricas. Al tener varias variables
+categóricas indica que vamos a tener que codificarlas antes de hacer los modelos.
+
+```{r target-resumen}
+summary(train$SalePrice)
+```
+
+```{r target-skew}
+# Calculamos la asimetría.
+skewness <- function(x) {
+  x <- x[!is.na(x)]
+  mean((x - mean(x))^3) / (sd(x)^3)
+}
+cat("Asimetría de SalePrice      :", round(skewness(train$SalePrice), 3), "\n")
+cat("Asimetría de log(SalePrice) :", round(skewness(log(train$SalePrice)), 3), "\n")
+```
+
+La asimetría pasa de ~2.03 (muy sesgada a la derecha) a ~-0.06 (casi
+simétrica) al aplicar logaritmo. Esto nos dice que hay un beneficio al utilizar el logaritmo, entonces
+modelaremos `log(SalePrice)` y se des transforma al final con `exp()`. Esto ayuda a minimizar los errores 
+cuando hay casas muy caras o datos outliers.
+
+```{r target-hist, fig.width=10, fig.height=4}
+# Comparamos visualmente la distribución original vs. la que usa logaritmo.
+par(mfrow = c(1, 2))
+hist(train$SalePrice, breaks = 40, col = "steelblue", border = "white",
+     main = "SalePrice (original)", xlab = "Precio de venta")
+hist(log(train$SalePrice), breaks = 40, col = "darkorange", border = "white",
+     main = "log(SalePrice)", xlab = "log(Precio de venta)")
+par(mfrow = c(1, 1))
+```
+
+# Análisis de valores faltantes
+
+Es importante definir como tratamos los datos faltantes, porque
+muchos valores `NA` no son datos perdidos sino que la casa no tiene la característica (ejemplo una casa
+sin piscina tiene `PoolQC = NA`).
+
+```{r faltantes-tabla}
+# Contamos NA y cadenas vacías "".
+contar_faltantes <- function(df) {
+  na <- sapply(df, function(x) sum(is.na(x) | x == ""))
+  na <- na[na > 0]
+  data.frame(
+    variable = names(na),
+    n_faltantes = as.integer(na),
+    pct = round(100 * as.integer(na) / nrow(df), 1),
+    row.names = NULL
+  ) %>% arrange(desc(n_faltantes))
+}
+
+faltantes_train <- contar_faltantes(train)
+faltantes_train
+```
+
+```{r faltantes-plot, fig.height=6}
+# Visualizamos el porcentaje de faltantes por variable para priorizar el tratamiento.
+ggplot(faltantes_train, aes(x = reorder(variable, pct), y = pct)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Porcentaje de valores faltantes por variable (train)",
+       x = NULL, y = "% faltante") +
+  theme_minimal()
+```
+
+**Interpretación:**
+
+- `PoolQC` (99.4% de faltantes), `MiscFeature`, `Alley`, `Fence`, `FireplaceQu`, y los bloques
+  `Garage*` y `Bsmt*`: el `NA` significa que no tiene.
+  → Se imputarán con una categoría explícita `"None"` (o 0 en sus áreas numéricas).
+- `LotFrontage` (18.9%): faltante numérico genuino, usaremos la mediana de los datos dentro del mismo Neighborhood 
+    ya que las casas tendrian lotes similares.
+
+# Relación de las variables numéricas con el precio
+
+```{r correlaciones}
+# Correlación de cada numérica con SalePrice.
+# Sirve como primer filtro
+num <- train[, tipos %in% c("numeric", "integer")]
+num <- num[, !names(num) %in% "Id"]   # Id es un identificador, no aporta señal.
+cors <- sapply(num[, names(num) != "SalePrice"], function(x) {
+  if (all(is.na(x))) return(NA)
+  cor(x, train$SalePrice, use = "complete.obs")
+})
+cor_df <- data.frame(variable = names(cors), correlacion = round(cors, 3)) %>%
+  arrange(desc(abs(correlacion)))
+head(cor_df, 15)
+```
+
+```{r corr-plot, fig.height=6}
+# Graficamos las 15 numéricas más correlacionadas (en valor absoluto) con el precio.
+top15 <- head(cor_df, 15)
+ggplot(top15, aes(x = reorder(variable, correlacion), y = correlacion)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top 15 correlaciones con SalePrice", x = NULL, y = "Correlacion de Pearson") +
+  theme_minimal()
+```
+
+Las predictoras más fuertes son `OverallQual` (calidad general, 0.79), `GrLivArea`
+(área habitable, 0.71), `TotalBsmtSF`, `GarageCars`/`GarageArea` y `X1stFlrSF`.
+
+```{r scatter-qual, fig.width=7, fig.height=4}
+# Relación más fuerte: calidad general vs. precio. Usamos jitter porque OverallQual
+# es discreta (1-10) y así evitamos el solapamiento de puntos.
+ggplot(train, aes(OverallQual, SalePrice)) +
+  geom_jitter(alpha = 0.4, width = 0.2, color = "steelblue") +
+  geom_smooth(method = "lm", se = FALSE, color = "darkred") +
+  labs(title = "Calidad general (OverallQual) vs. Precio") + theme_minimal()
+```
+
+```{r scatter-area, fig.width=7, fig.height=4}
+# Segunda relación mas fuerte: área habitable vs. precio. Aquí se buscan
+# outliers (puntos de área muy grande con precio bajo).
+ggplot(train, aes(GrLivArea, SalePrice)) +
+  geom_point(alpha = 0.4, color = "steelblue") +
+  geom_smooth(method = "lm", se = FALSE, color = "darkred") +
+  labs(title = "Area habitable (GrLivArea) vs. Precio") + theme_minimal()
+```
+
+# Detección preliminar de outliers
+Buscamos cosas como Casas muy grandes pero con precios bajos, entre otras.
+
+```{r outliers}
+# Candidatos a outlier: área habitable muy grande con precio bajo.
+train %>%
+  filter(GrLivArea > 4000) %>%
+  select(Id, GrLivArea, OverallQual, SalePrice) %>%
+  arrange(desc(GrLivArea))
+```
+
+# Variables categóricas: cardinalidad
+
+```{r cardinalidad}
+# Cardinalidad de variables categoricas
+chars <- names(train)[tipos == "character"]
+card <- sapply(chars, function(c) length(unique(train[[c]])))
+data.frame(variable = names(card), n_niveles = as.integer(card)) %>%
+  arrange(desc(n_niveles)) %>% head(15)
+```
+
+`Neighborhood` (25 niveles), `Exterior1st/2nd` (15) son las de mayor cardinalidad.
+
+# Conclusiones del EDA
+
+1. **Objetivo:** modelar `log(SalePrice)` ya que esto ayuda a que la distribucion de datos sea mas simetrica.
+2. **Faltantes estructurales:** la mayoría de `NA` significan "no tiene".
+    Solo `LotFrontage`, `MasVnr*` y `Electrical` son faltantes reales.
+3. **Variables fuertes:** calidad (`OverallQual`) y superficie (`GrLivArea`, `TotalBsmtSF`,
+   garaje) son las de mayor correlacion.
+4. **Outliers:** revisar las viviendas con `GrLivArea > 4000` y precio bajo.
+5. **Categóricas:** alta cardinalidad en `Neighborhood`/`Exterior*`
+
+# Limpieza y preprocesamiento
+
+Hacemos una transformacion a todos los datos primero y luego volvemos a separar los datasets.
+
+```{r combinar}
+# Añadimos un marcador para poder separar después
+train_m <- train %>% mutate(is_train = 1L)
+test_m  <- test  %>% mutate(is_train = 0L, SalePrice = NA_real_)
+
+full <- bind_rows(train_m, test_m)
+cat("Dataset combinado:", nrow(full), "filas x", ncol(full), "columnas\n")
+
+# Unificamos cadenas vacías "" como NA en las columnas de texto, para tratar
+# todos los faltantes
+chars_all <- names(full)[sapply(full, is.character)]
+full[chars_all] <- lapply(full[chars_all], function(x) ifelse(x == "", NA, x))
+```
+
+## Imputación de faltantes estructurales ("no tiene")
+
+Según el diccionario de Ames, en estas variables el `NA` significa **ausencia** de la
+característica. Imputamos una categoría `"None"` para mantener esa información
+(una casa sin piscina da informacion importante).
+
+```{r imputar-estructurales}
+# Categóricas donde NA = "no tiene esa característica".
+cat_none <- c("PoolQC", "MiscFeature", "Alley", "Fence", "FireplaceQu",
+              "GarageType", "GarageFinish", "GarageQual", "GarageCond",
+              "BsmtQual", "BsmtCond", "BsmtExposure", "BsmtFinType1", "BsmtFinType2",
+              "MasVnrType")
+for (v in cat_none) full[[v]][is.na(full[[v]])] <- "None"
+
+# Numéricas asociadas a esas características
+num_zero <- c("MasVnrArea", "BsmtFinSF1", "BsmtFinSF2", "BsmtUnfSF", "TotalBsmtSF",
+              "BsmtFullBath", "BsmtHalfBath", "GarageCars", "GarageArea")
+for (v in num_zero) full[[v]][is.na(full[[v]])] <- 0
+```
+
+## Imputación de faltantes genuinos
+
+```{r imputar-genuinos}
+# cuando GarageYrBlt es NA asumimos que fue construido cuando se construyo la casa, poner 0 seria un dato incorrecto
+full$GarageYrBlt[is.na(full$GarageYrBlt)] <- full$YearBuilt[is.na(full$GarageYrBlt)]
+
+# LotFrontage (frente de lote): faltante real. El frente es consistente dentro de un
+#    mismo vecindario, así que imputamos con la MEDIANA por Neighborhood
+full <- full %>%
+  group_by(Neighborhood) %>%
+  mutate(LotFrontage = ifelse(is.na(LotFrontage),
+                              median(LotFrontage, na.rm = TRUE), LotFrontage)) %>%
+  ungroup()
+full$LotFrontage[is.na(full$LotFrontage)] <- median(full$LotFrontage, na.rm = TRUE)
+
+# Electrical: 1 solo faltante, solo le agregamos la moda al ser un dato no es tan importante.
+moda <- function(x) names(sort(table(x), decreasing = TRUE))[1]
+full$Electrical[is.na(full$Electrical)] <- moda(full$Electrical)
+```
+
+```{r verificar-na}
+# Verificación
+na_restantes <- sapply(full, function(x) sum(is.na(x)))
+na_restantes <- na_restantes[na_restantes > 0]
+na_restantes
+```
+
+## Tratamiento de outliers
+
+Del EDA, las casas con `GrLivArea > 4000`:
+una casa definitamente es outlier (la de Id 524: 4676 pies² pero con precio $184,750, esta casa no 
+representa el mercado). Eliminamos solo ese caso del dataset de train para no afectar al modelo
+
+```{r outliers-tratamiento}
+# Eliminamos la venta anómala Id 524
+n_antes <- sum(full$is_train == 1)
+full <- full %>% filter(!(is_train == 1 & Id == 524))
+cat("Filas de train antes:", n_antes, "-> después:", sum(full$is_train == 1), "\n")
+```
+
+## Ingeniería de variables
+
+Creamos variables que pueden ayudar al modelo
+
+```{r feature-engineering}
+full <- full %>% mutate(
+  # Superficie total habitable: sótano + 1er + 2do piso. Resume el tamaño en una sola
+  # variable muy correlacionada con el precio.
+  TotalSF       = TotalBsmtSF + X1stFlrSF + X2ndFlrSF,
+  # Total de baños (los de sótano cuentan como 0.5 los medios baños).
+  TotalBaths    = FullBath + 0.5 * HalfBath + BsmtFullBath + 0.5 * BsmtHalfBath,
+  # Antiguedad de la casa al momento de la venta y años desde la última remodelación.
+  HouseAge      = YrSold - YearBuilt,
+  RemodAge      = YrSold - YearRemodAdd,
+  # Porche total y bandera de remodelación (1 si se remodeló después de construida).
+  TotalPorchSF  = OpenPorchSF + EnclosedPorch + X3SsnPorch + ScreenPorch + WoodDeckSF,
+  Remodelada    = ifelse(YearRemodAdd > YearBuilt, 1L, 0L),
+  # Banderas de presencia (señal simple y robusta).
+  TienePiscina  = ifelse(PoolArea > 0, 1L, 0L),
+  TieneGaraje   = ifelse(GarageArea > 0, 1L, 0L),
+  TieneSotano   = ifelse(TotalBsmtSF > 0, 1L, 0L),
+  Tiene2doPiso  = ifelse(X2ndFlrSF > 0, 1L, 0L)
+)
+
+# Arreglamos una inconsistencia de los datos (YrSold < YearBuilt) por errores
+# de captura y les ponemos 0
+full$HouseAge[full$HouseAge < 0] <- 0
+full$RemodAge[full$RemodAge < 0] <- 0
+
+cat("Nuevas variables creadas. Total de columnas ahora:", ncol(full), "\n")
+```
+
+## Codificación de categóricas y separación final
+
+```{r codificar-separar}
+# Convertimos todas las variables de texto a factor
+chars_final <- names(full)[sapply(full, is.character)]
+full[chars_final] <- lapply(full[chars_final], factor)
+
+# Separamos de nuevo en train y test limpios.
+train_clean <- full %>% filter(is_train == 1) %>% select(-is_train)
+test_clean  <- full %>% filter(is_train == 0) %>% select(-is_train, -SalePrice)
+
+cat("train_clean:", nrow(train_clean), "x", ncol(train_clean), "\n")
+cat("test_clean :", nrow(test_clean),  "x", ncol(test_clean),  "\n")
+
+# Guardamos los datasets limpios para reutilizarlos en el modelado.
+saveRDS(train_clean, "train_clean.rds")
+saveRDS(test_clean,  "test_clean.rds")
+```
+
+# Conclusiones de la limpieza
+
+- **Faltantes resueltos**: Verificamos que no quedan `NA`.
+- **Outlier anómalo** (Id 524) eliminado solo del train.
+- **Nuevas variables** superficie total, baños totales, antigüedad, banderas
+- **Categóricas codificadas** consistentemente entre train y test.
+
+# Modelado
+
+Usamos una regresión lineal  como
+base, y regularización Ridge , Lasso , Elastic-Net** (`glmnet`), evaluadas con cross validation
+usando **RMSE** como metrica
+
+```{r librerias-modelo}
+library(glmnet)   
+set.seed(2026)   
+```
+
+## Preparación: objetivo, matriz de diseño y función de error
+
+```{r prep-modelo}
+# SalePrice (variable y) como logaritmo
+y <- log(train_clean$SalePrice)
+
+# Predictoras: quitamos Id  y SalePrice 
+pred_train <- train_clean %>% select(-Id, -SalePrice)
+pred_test  <- test_clean  %>% select(-Id)
+
+# Construimos una matriz de diseño
+combined <- bind_rows(pred_train, pred_test)
+X_all   <- model.matrix(~ ., data = combined)[, -1]   # [,-1] elimina el intercepto.
+X_train <- X_all[1:nrow(pred_train), ]
+X_test  <- X_all[(nrow(pred_train) + 1):nrow(X_all), ]
+cat("Matriz de diseño X_train:", nrow(X_train), "filas x", ncol(X_train), "columnas\n")
+```
+
+```{r rmse-fun}
+# RMSE en su escala original ya que las predicciones se hacen en log, así que exponenciamos antes
+# de comparar contra el precio real
+rmse_orig <- function(pred_log, actual_orig) {
+  sqrt(mean((exp(pred_log) - actual_orig)^2))
+}
+
+# Validación cruzada K-fold Definimos los folds una sola vez para comparar
+# todos los modelos sobre las mismas particiones
+K <- 5
+folds <- sample(rep(1:K, length.out = nrow(X_train)))
+
+# recibe una función que ajusta y predice, y devuelve el RMSE por fold.
+cv_rmse <- function(fit_predict) {
+  out <- numeric(K)
+  for (k in 1:K) {
+    tr <- which(folds != k); va <- which(folds == k)
+    pred_log <- fit_predict(X_train[tr, ], y[tr], X_train[va, ])
+    out[k] <- rmse_orig(pred_log, train_clean$SalePrice[va])
+  }
+  out
+}
+```
+
+## Modelo base: regresión lineal (OLS)
+
+```{r ols}
+# OLS sobre todas las predictoras. Es nuestra línea base de referencia
+ols <- function(Xtr, ytr, Xva) {
+  df <- data.frame(y = ytr, Xtr); colnames(df) <- c("y", colnames(Xtr))
+  m  <- lm(y ~ ., data = df)
+  nd <- data.frame(Xva); colnames(nd) <- colnames(Xtr)
+  as.numeric(predict(m, nd))
+}
+r_ols <- cv_rmse(ols)
+cat(sprintf("OLS — RMSE CV: %.0f (sd %.0f)\n", mean(r_ols), sd(r_ols)))
+```
+
+el modelo de regresion lineal OLS sobreajusta, ya que su RMSE de validación es alto y muy variable.
+
+## Modelos regularizados: Ridge, Lasso y Elastic-Net
+
+```{r glmnet-cv}
+glm_fit <- function(alpha) function(Xtr, ytr, Xva) {
+  cv <- cv.glmnet(Xtr, ytr, alpha = alpha, nfolds = 5)
+  as.numeric(predict(cv, newx = Xva, s = "lambda.min"))
+}
+
+alphas <- c(0, 0.25, 0.5, 0.75, 1)
+resultados <- lapply(alphas, function(a) {
+  r <- cv_rmse(glm_fit(a))
+  data.frame(alpha = a, RMSE = mean(r), sd = sd(r))
+})
+tabla_glm <- do.call(rbind, resultados)
+tabla_glm$modelo <- c("Ridge", "Elastic-Net", "Elastic-Net", "Elastic-Net", "Lasso")
+tabla_glm[, c("modelo", "alpha", "RMSE", "sd")]
+```
+
+```{r comparacion}
+# Tabla comparativa final
+comparacion <- rbind(
+  data.frame(modelo = "OLS", alpha = NA, RMSE = mean(r_ols), sd = sd(r_ols)),
+  tabla_glm[, c("modelo", "alpha", "RMSE", "sd")]
+)
+comparacion <- comparacion %>% arrange(RMSE)
+comparacion
+
+# Elegimos el mejor alpha (menor RMSE de validación).
+mejor_alpha <- tabla_glm$alpha[which.min(tabla_glm$RMSE)]
+cat("Mejor alpha (Elastic-Net):", mejor_alpha, "\n")
+```
+
+```{r comparacion-plot, fig.width=8, fig.height=4}
+# Visualizamos el RMSE por modelo
+ggplot(comparacion, aes(x = reorder(modelo, -RMSE), y = RMSE)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = round(RMSE)), vjust = -0.3, size = 3) +
+  labs(title = "RMSE de validacion cruzada por modelo",
+       x = NULL, y = "RMSE (escala original, USD)") +
+  theme_minimal()
+```
+
+La regularización reduce el RMSE de ~28,500 (OLS base) a ~22,100. El Elastic-Net  obtiene el mejor resultado
+
+## Selección de variables embebida (Lasso)
+
+```{r lasso-seleccion}
+# El Lasso realiza selección de variables embebida lleva coeficientes a 0.
+# Ajustamos sobre todo el train para ver cuántas variables retiene el modelo.
+cv_lasso <- cv.glmnet(X_train, y, alpha = 1, nfolds = 5)
+coefs <- coef(cv_lasso, s = "lambda.min")
+n_total <- nrow(coefs) - 1                 # -1 por el intercepto
+n_activas <- sum(coefs[-1, 1] != 0)
+cat("Variables disponibles:", n_total, "| seleccionadas por Lasso:", n_activas,
+    sprintf("(%.0f%% descartadas)\n", 100 * (1 - n_activas / n_total)))
+```
+
+El Lasso descarta automáticamente las variables irrelevantes, dejando un modelo más simple e
+interpretable.
+
+## Primer modelo estable
+
+```{r modelo-1}
+# Reentrenamos el mejor modelo (Elastic-Net con el alpha elegido) sobre el train,
+# eligiendo lambda por CV. Luego predecimos el test
+set.seed(2026)
+modelo_final <- cv.glmnet(X_train, y, alpha = mejor_alpha, nfolds = 5)
+
+pred_log  <- as.numeric(predict(modelo_final, newx = X_test, s = "lambda.min"))
+pred_price <- exp(pred_log)   # convirtiendo a la escala original
+
+summary(pred_price)
+```
+
+```{r submission}
+# Construimos el archivo de entrega con el formato de sample_submission (Id, SalePrice).
+submission <- data.frame(Id = test_clean$Id, SalePrice = pred_price)
+write.csv(submission, "submission_elasticnet.csv", row.names = FALSE)
+cat("Archivo 'submission_elasticnet.csv' generado con", nrow(submission), "predicciones.\n")
+head(submission)
+```
+
+# Conclusiones del modelado
+
+- **OLS sobreajusta** (RMSE ~28,500, alta varianza) por la gran cantidad de predictores
+  colineales
+- **La regularización**  reduce y estabiliza el error
+- El Elastic-Net (α ≈ `r mejor_alpha`) es el mejor modelo (RMSE ~22,100)
+
+
+# Primeras mejoras realizadas  (modelos de árboles)
+
+Nos dimos cuenta que habia una casa en especifico que predeciamos demasiado alto (casi 3 millones),
+lo cual vimos que era un problema porque tenia mucho impacto en nuestro RMSE
+
+## Modelos de árboles
+
+Los modelos basados en árboles (**Random Forest**, **Gradient Boosting**) no extrapolan, es decir,
+nunca predicen por encima del rango visto en entrenamiento. por eso son buenos para resolver nuestro problema de la
+casa outlier
+
+```{r librerias-arboles}
+library(ranger)    # Random Forest.
+library(xgboost)   # Gradient Boosting.
+set.seed(2026)
+```
+
+```{r random-forest}
+# Random Forest sobre el data.frame con factores (ranger maneja factores nativamente).
+df_train_rf <- data.frame(y = y, pred_train)
+
+rf_fit <- function(Xtr_idx, ytr, Xva_idx) {
+  m <- ranger(y ~ ., data = df_train_rf[Xtr_idx, ], num.trees = 500,
+              mtry = floor(ncol(pred_train) / 3), min.node.size = 5, seed = 1)
+  predict(m, df_train_rf[Xva_idx, ])$predictions
+}
+# CV específica para RF (usa índices de filas, no la matriz X).
+r_rf <- numeric(K)
+for (k in 1:K) {
+  tr <- which(folds != k); va <- which(folds == k)
+  r_rf[k] <- rmse_orig(rf_fit(tr, y[tr], va), train_clean$SalePrice[va])
+}
+cat(sprintf("Random Forest — RMSE CV: %.0f (sd %.0f)\n", mean(r_rf), sd(r_rf)))
+```
+
+```{r xgboost}
+# Gradient Boosting con xgboost (usa la matriz numérica X_train).
+params <- list(eta = 0.05, max_depth = 3, subsample = 0.8, colsample_bytree = 0.8)
+r_xgb <- numeric(K)
+for (k in 1:K) {
+  tr <- which(folds != k); va <- which(folds == k)
+  m <- xgb.train(params, xgb.DMatrix(X_train[tr, ], label = y[tr]),
+                 nrounds = 600, verbose = 0)
+  pred_log <- predict(m, xgb.DMatrix(X_train[va, ]))
+  r_xgb[k] <- rmse_orig(pred_log, train_clean$SalePrice[va])
+}
+cat(sprintf("XGBoost — RMSE CV: %.0f (sd %.0f)\n", mean(r_xgb), sd(r_xgb)))
+```
+
+```{r arboles-submissions}
+# Reentrenamos ambos en todo el train y predecimos el test.
+m_rf  <- ranger(y ~ ., data = df_train_rf, num.trees = 500,
+                mtry = floor(ncol(pred_train) / 3), min.node.size = 5, seed = 1)
+pred_rf <- exp(predict(m_rf, pred_test)$predictions)
+
+m_xgb <- xgb.train(params, xgb.DMatrix(X_train, label = y), nrounds = 600, verbose = 0)
+pred_xgb <- exp(predict(m_xgb, xgb.DMatrix(X_test)))
+
+write.csv(data.frame(Id = test_clean$Id, SalePrice = pred_rf),
+          "submission_rf.csv", row.names = FALSE)
+write.csv(data.frame(Id = test_clean$Id, SalePrice = pred_xgb),
+          "submission_xgboost.csv", row.names = FALSE)
+
+# Verificamos que NO extrapolan (predicción máxima dentro del rango del train).
+cat(sprintf("RF  -> máx pred: %s | >755k: %d\n", format(round(max(pred_rf)), big.mark=","),
+            sum(pred_rf > 755000)))
+cat(sprintf("XGB -> máx pred: %s | >755k: %d\n", format(round(max(pred_xgb)), big.mark=","),
+            sum(pred_xgb > 755000)))
+```
+
+Estos nuevos modelos de árboles predicen la casa outlier dentro del rango histórico (511k–577k mas o menos),
+eliminando el error enorme de extrapolacion.
+
+# Conclusiones de las mejoras
+
+- **Causa del problema con el modelo:** los modelos lineales extrapolan y predicen una casa
+  extrema en 3 millones aproximadamante, lo cual afecta grandemente al RMSE.
+- **Árboles:** Random Forest y XGBoost son modelos que no extrapolan (La prediccion maxima es entre 511k–577k), lo que los 
+              hace modelos mas robustos.
+
+# Modelo final: *blend* + regla de extrapolación
+
+Los modelos de arboles tuvieron los mejores resultados hasta ahora, asi que tuvimos unas
+ultimas ideas para perfeccionar el modelo. Nuestro modelo final combina dos ideas:
+
+1. Un ensamble blend o combinacion del Elastic-Net (que es preciso en las casas normales) con el XGBoost
+   (ayuda con el problema de extrapolacion), para aprovechar lo mejor de ambos.
+2. Una regla de extrapolación por comparables para la única casa que se sale del rango de
+   entrenamiento (Id 1299).
+
+## Elección del peso del *blend* por validación cruzada
+
+```{r blend-peso}
+# Escogemos el peso con el que minimiza el RMSE.
+oof_en  <- numeric(nrow(X_train))   # Elastic-Net (alpha = 0.5)
+oof_xgb <- numeric(nrow(X_train))   # XGBoost (mismos hiperparámetros de la Parte 4)
+
+for (k in 1:K) {
+  tr <- which(folds != k); va <- which(folds == k)
+  set.seed(2026)
+  cv_en <- cv.glmnet(X_train[tr, ], y[tr], alpha = 0.5, nfolds = 5)
+  oof_en[va] <- exp(as.numeric(predict(cv_en, newx = X_train[va, ], s = "lambda.min")))
+  set.seed(2026)
+  m_k <- xgb.train(params, xgb.DMatrix(X_train[tr, ], label = y[tr]), nrounds = 600, verbose = 0)
+  oof_xgb[va] <- exp(predict(m_k, xgb.DMatrix(X_train[va, ])))
+}
+
+actual <- train_clean$SalePrice
+pesos  <- seq(0, 1, by = 0.05)
+barrido <- data.frame(
+  w_EN = pesos,
+  RMSE = sapply(pesos, function(w) rmse_orig(log(w * oof_en + (1 - w) * oof_xgb), actual))
+)
+mejor_w <- barrido$w_EN[which.min(barrido$RMSE)]
+head(barrido[order(barrido$RMSE), ], 5)
+cat(sprintf("\nRMSE Elastic-Net solo: %.0f | XGBoost solo: %.0f\n",
+            rmse_orig(log(oof_en), actual), rmse_orig(log(oof_xgb), actual)))
+cat(sprintf("Mejor peso w_EN = %.2f -> RMSE blend: %.0f\n", mejor_w, min(barrido$RMSE)))
+```
+
+El blend con **w = `r mejor_w`** (70% Elastic-Net, 30% XGBoost) obtiene un RMSE de validación
+menor que el de cualquiera de los dos modelos por separado, lo cual nos dice que este es el modelo correcto
+
+## Construcción del *blend* sobre el test
+
+```{r blend-test}
+# Reutilizamos las predicciones ya entrenadas en todo el train:
+#   pred_price = Elastic-Net (Parte 3) ; pred_xgb = XGBoost (Parte 4).
+pred_blend <- mejor_w * pred_price + (1 - mejor_w) * pred_xgb
+cat("Blend construido. Máximo antes de la regla:",
+    format(round(max(pred_blend)), big.mark = ","), "\n")
+```
+
+## Regla de extrapolación por ventas comparables
+
+```{r regla-extrapolacion}
+# Necesitamos el train sin limpiar para buscar comparables
+train_raw <- read.csv(file.path(base, "data_train_v3.csv"), stringsAsFactors = FALSE)
+
+# 1) Umbral de extrapolación = máximo GrLivArea visto en el entrenamiento.
+umbral      <- max(train_clean$GrLivArea)
+fuera_rango <- which(test_clean$GrLivArea > umbral)
+cat("Umbral (máx GrLivArea train):", umbral, "\n")
+cat("Casas del test fuera de rango:", length(fuera_rango),
+    "(Id:", paste(test_clean$Id[fuera_rango], collapse = ", "), ")\n\n")
+
+# 2) Para cada casa fuera de rango,  estimamos el precio
+#    con el COMPARABLE más cercano por tamaño (GrLivArea) entre ventas de la misma condición
+#    de venta (SaleCondition).
+estimar_comparable <- function(id_test) {
+  fila  <- test_clean[test_clean$Id == id_test, ]
+  cond  <- as.character(fila$SaleCondition)
+  cands <- train_raw[train_raw$SaleCondition == cond, ]   # ventas de la misma condición
+  vecino <- cands[which.min(abs(cands$GrLivArea - fila$GrLivArea)), ]  # más cercano por tamaño
+  cat(sprintf("  Id %d (%s, GrLivArea %d) -> comparable Id %d (GrLivArea %d) = %s\n",
+              id_test, cond, fila$GrLivArea, vecino$Id, vecino$GrLivArea,
+              format(vecino$SalePrice, big.mark = ",")))
+  vecino$SalePrice
+}
+
+# 3) Aplicamos la regla al blend 
+pred_final <- pred_blend
+for (i in fuera_rango) pred_final[i] <- estimar_comparable(test_clean$Id[i])
+
+cat(sprintf("\nId 1299: blend lineal = %s  ->  regla (comparable) = %s\n",
+            format(round(pred_blend[fuera_rango]), big.mark = ","),
+            format(round(pred_final[fuera_rango]), big.mark = ",")))
+```
+
+La regla asigna a la casa extrema el precio de su comparable más parecido en tamaño y tipo de
+venta (~184,750), lo cual es un valor realista derivado de los datos.
+
+## Submission final
+
+```{r submission-final}
+submission_final <- data.frame(Id = test_clean$Id, SalePrice = pred_final)
+write.csv(submission_final, "submission_final_blend.csv", row.names = FALSE)
+cat("Archivo 'submission_final_blend.csv' generado con",
+    nrow(submission_final), "predicciones.\n")
+summary(submission_final$SalePrice)
+```
+
+# Conclusiones finales
+
+- El modelo final es un blend **`r mejor_w`·Elastic-Net + `r round(1-mejor_w,2)`·XGBoost**,
+  con una regla de extrapolación por comparables para las casas fuera del rango
+- El blend mejora el RMSE de validación respecto a los modelos individuales y la regla elimina el error 
+  enorme de extrapolación de la casa outlier.
+- Entrega final: **`submission_tier2_regla_blend.csv`** y tuvo el mejor score publico en kaggle con: **23668.72515**.
+
+
